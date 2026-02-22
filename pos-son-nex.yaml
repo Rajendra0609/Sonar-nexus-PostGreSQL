@@ -1,0 +1,113 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: postgres_sonar
+    restart: always
+    environment:
+      - POSTGRES_DB:${POSTGRES_DB}
+      - POSTGRES_USER:${POSTGRES_USER}
+      - POSTGRES_PASSWORD:${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres/data:/var/lib/postgresql/data
+    mem_limit: 1G
+    memswap_limit: 2G  
+    networks:
+      - sonar-nexus
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "sonar"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    env_file:
+      - .env
+
+
+  sonarqube:
+    image: sonarqube:8.9-community
+    container_name: sonarqube
+    restart: always
+    ports:
+      - "9000:9000"
+    environment:
+      - SONAR_JDBC_URL=jdbc:postgresql://postgres:5432/sonar
+      - SONAR_JDBC_USERNAME=${POSTGRES_USER}
+      - SONAR_JDBC_PASSWORD=${POSTGRES_PASSWORD}
+      - SONAR_EMBEDDED_DATABASE_PORT=5432
+      - SONAR_WEB_JVM_OPTS=${SONAR_WEB_JVM_OPTS}
+      - SONAR_CE_JVM_OPTS=${SONAR_CE_JVM_OPTS}
+      - SONAR_SEARCH_JVM_OPTS=${SONAR_SEARCH_JVM_OPTS}
+      - .env
+    volumes:
+      - sonarqube_data_all:/opt/sonarqube/data
+      - sonarqube_data_all:/opt/sonarqube/extensions
+      - sonarqube_data_all:/opt/sonarqube/logs
+      - sonarqube_data_all:/opt/sonarqube/temp
+      - sonarqube_data_all:/opt/sonarqube/bundled-plugins
+    mem_limit: 1G
+    memswap_limit: 2G  # Total memory + swap limit
+    healthcheck:
+      test: ["CMD-SHELL", "curl -I http://localhost:9000"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      - postgres
+    user: "1000:1000"  # runs as a non-root user
+    read_only: true    # make root file system read-only
+    tmpfs:
+      - /tmp           # temp file system
+    cap_drop:
+      - ALL            # drop all the linux capabilities
+    security_opt:
+      - no-new-privileges:true   #prevent privilege escalation
+    networks:
+      - sonar-nexus
+
+  nexus:
+    image: sonatype/nexus3
+    container_name: nexus
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      - INSTALL4J_ADD_VM_PARAMS=-Xms1g -Xmx1g -XX:MaxDirectMemorySize=512m -Djava.util.prefs.userRoot=/nexus-data/javaprefs
+    volumes:
+      - nexus-data:/nexus-data
+    mem_limit: 1G
+    memswap_limit: 3G
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8081/service/rest/v1/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    stop_grace_period: 120s
+    init: true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    networks:
+      - sonar-nexus
+
+
+
+volumes:
+  sonarqube_data_all:
+  nexus-data:
+
+networks:
+  sonar-nexus:
+    driver: bridge
+
+
