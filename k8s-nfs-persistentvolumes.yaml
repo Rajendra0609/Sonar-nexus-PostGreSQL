@@ -1,0 +1,119 @@
+# ============================================================================
+# STATIC PERSISTENT VOLUMES (in-tree NFS plugin — no CSI driver required)
+# ============================================================================
+# Each PV below is manually pre-bound (via claimRef) to one specific PVC so
+# there's no ambiguous matching between same-sized claims (e.g. the two 5Gi
+# SonarQube volumes). Apply this file BEFORE (or together with) the main
+# manifest — the PVCs in that file will bind to these on creation.
+#
+# REQUIRED ON THE NFS SERVER (172.16.0.5) BEFORE APPLYING:
+#   sudo mkdir -p /opt/sonar/{postgresql-data,sonarqube-data,sonarqube-extensions,sonarqube-logs,nexus-data}
+#   sudo chown -R nobody:nogroup /opt/sonar
+#   sudo chmod -R 777 /opt/sonar        # init containers chown per-app on first mount; loosen now, tighten later if you want
+#
+# REQUIRED ON EVERY KUBERNETES NODE (kubelet mounts NFS directly, no driver pod involved):
+#   # Debian/Ubuntu
+#   sudo apt-get install -y nfs-common
+#   # RHEL/CentOS/Rocky
+#   sudo yum install -y nfs-utils
+#
+# You do NOT need the csi-driver-nfs controller/node pods for this approach.
+# The "nfs-storage" StorageClass object can stay in your cluster (harmless —
+# it's just used here as a label so PV/PVC storageClassName strings match)
+# or you can delete it; either way these PVs bind statically regardless.
+# ============================================================================
+
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: postgresql-data-pv
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: nfs-storage
+  nfs:
+    server: 172.16.0.5
+    path: /opt/sonar/postgresql-data
+  claimRef:
+    namespace: devops-tools
+    # StatefulSet volumeClaimTemplate PVC naming pattern: <template-name>-<pod-name>
+    name: postgresql-data-postgresql-0
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: sonarqube-data-pv
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: nfs-storage
+  nfs:
+    server: 172.16.0.5
+    path: /opt/sonar/sonarqube-data
+  claimRef:
+    namespace: devops-tools
+    name: sonarqube-data
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: sonarqube-extensions-pv
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: nfs-storage
+  nfs:
+    server: 172.16.0.5
+    path: /opt/sonar/sonarqube-extensions
+  claimRef:
+    namespace: devops-tools
+    name: sonarqube-extensions
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: sonarqube-logs-pv
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: nfs-storage
+  nfs:
+    server: 172.16.0.5
+    path: /opt/sonar/sonarqube-logs
+  claimRef:
+    namespace: devops-tools
+    name: sonarqube-logs
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nexus-data-pv
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: nfs-storage
+  nfs:
+    server: 172.16.0.5
+    path: /opt/sonar/nexus-data
+  claimRef:
+    namespace: devops-tools
+    name: nexus-data
