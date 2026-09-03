@@ -1,0 +1,1014 @@
+# ============================================================================
+# PRODUCTION MANIFEST v2: PostgreSQL (StatefulSet) + SonarQube + Nexus
+# ============================================================================
+# CHANGES FROM v1:
+#   - Image tags updated to current latest stable releases (checked live):
+#       postgres          16.4-alpine       -> 18.4-alpine
+#       sonarqube         10.6.0-community  -> 26.8.0.126808-community (SonarQube Community Build)
+#       sonatype/nexus3   3.70.1            -> 3.94.2-alpine
+#   - Standard Kubernetes recommended labels added to every object
+#     (app.kubernetes.io/name, instance, version, component, part-of, managed-by)
+#   - nodeAffinity + tolerations added so all workloads land only on your
+#     dedicated, tainted node pool (see "NODE PREP" below — you must label
+#     and taint your nodes BEFORE applying this file)
+#   - PriorityClasses added (Postgres > SonarQube/Nexus)
+#   - ResourceQuota + LimitRange added for the namespace
+#   - NetworkPolicies added (default-deny + explicit allows)
+#   - Dedicated ServiceAccounts per component, token automount disabled
+#   - Hardened pod/container securityContext (non-root, no priv escalation,
+#     capabilities dropped) — init containers are the sole exception since
+#     they need root for chown/sysctl
+#   - Automated nightly PostgreSQL backup CronJob (pg_dump to NFS)
+#
+# ----------------------------------------------------------------------------
+# NODE PREP — run this BEFORE applying, against the nodes you want dedicated
+# to this workload:
+#
+#   kubectl label node <node1> <node2> workload-type=devops-tools
+#   kubectl taint node <node1> <node2> dedicated=devops-tools:NoSchedule
+#
+# Change "workload-type=devops-tools" / "dedicated=devops-tools" below (and
+# in the matching affinity/toleration blocks) if you'd rather use different
+# label/taint names.
+# ----------------------------------------------------------------------------
+#
+# STILL EDIT BEFORE APPLYING:
+#   1. StorageClass "nfs-storage" server/share (or your static PVs, if using those)
+#   2. Secret "postgresql-secret" -> real DB password
+#   3. Ingress hostnames
+#   4. Storage sizes / resource requests-limits / ResourceQuota totals, per
+#      your actual node capacity
+#   5. NODE_LABEL/TAINT values above, to match your actual nodes
+#
+# Apply with:  kubectl apply -f k8s-sonarqube-nexus-postgresql.yaml
+# ============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: devops-tools
+  labels:
+    name: devops-tools
+    app.kubernetes.io/managed-by: kubectl
+
+---
+# ============================================================================
+# PRIORITY CLASSES — Postgres is scheduled/preempts ahead of the app tier
+# ============================================================================
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: devops-tools-critical
+value: 1000000
+globalDefault: false
+description: "Database tier — highest scheduling priority in the devops-tools stack."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: devops-tools-standard
+value: 500000
+globalDefault: false
+description: "Application tier (SonarQube, Nexus) — scheduled below the database tier."
+
+---
+# ============================================================================
+# RESOURCE GOVERNANCE — namespace-wide guardrails
+# ============================================================================
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: devops-tools-quota
+  namespace: devops-tools
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 12Gi
+    pods: "10"
+    persistentvolumeclaims: "10"
+
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: devops-tools-limits
+  namespace: devops-tools
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "500m"
+        memory: "512Mi"
+      defaultRequest:
+        cpu: "100m"
+        memory: "128Mi"
+      max:
+        cpu: "4"
+        memory: "8Gi"
+      min:
+        cpu: "50m"
+        memory: "64Mi"
+
+---
+# ============================================================================
+# STORAGE — NFS StorageClass (EDIT THIS SECTION, or delete if using static PVs)
+# ============================================================================
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: nfs-storage
+  labels:
+    app.kubernetes.io/part-of: devops-tools-stack
+provisioner: nfs.csi.k8s.io          # <-- CHANGE if using a different NFS provisioner
+parameters:
+  server: 172.16.0.5                 # <-- CHANGE
+  share: /opt/sonar                  # <-- CHANGE
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
+
+---
+# ============================================================================
+# SECRETS
+# ============================================================================
+# NOTE: for real production, prefer an external secrets manager (Vault,
+# External Secrets Operator, Sealed Secrets, cloud KMS-backed secrets) over
+# a plain Secret object — this is a starting point, not a long-term answer.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgresql-secret
+  namespace: devops-tools
+  labels:
+    app.kubernetes.io/part-of: devops-tools-stack
+type: Opaque
+stringData:
+  POSTGRES_USER: sonarUser
+  POSTGRES_PASSWORD: CHANGE_ME_Strong_Password_123!
+  POSTGRES_DB: sonarqube
+
+---
+# ============================================================================
+# SERVICE ACCOUNTS — least privilege, no default token automount
+# ============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: postgresql-sa
+  namespace: devops-tools
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sonarqube-sa
+  namespace: devops-tools
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nexus-sa
+  namespace: devops-tools
+automountServiceAccountToken: false
+
+---
+# ============================================================================
+# NETWORK POLICIES — default deny, then explicit allows
+# ============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: devops-tools
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: devops-tools
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgresql-allow-ingress
+  namespace: devops-tools
+spec:
+  podSelector:
+    matchLabels:
+      app: postgresql
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: sonarqube
+        - podSelector:
+            matchLabels:
+              app: postgresql-backup   # the backup CronJob pod
+      ports:
+        - protocol: TCP
+          port: 5432
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sonarqube-egress-to-postgresql
+  namespace: devops-tools
+spec:
+  podSelector:
+    matchLabels:
+      app: sonarqube
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgresql
+      ports:
+        - protocol: TCP
+          port: 5432
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sonarqube-allow-ingress
+  namespace: devops-tools
+spec:
+  podSelector:
+    matchLabels:
+      app: sonarqube
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 9000
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nexus-allow-ingress
+  namespace: devops-tools
+spec:
+  podSelector:
+    matchLabels:
+      app: nexus
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8081
+        - protocol: TCP
+          port: 5000
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nexus-allow-internet-egress
+  namespace: devops-tools
+spec:
+  # Nexus proxies upstream repos (Maven Central, npm, Docker Hub, etc.) —
+  # it needs outbound internet access to function as a proxy repository.
+  podSelector:
+    matchLabels:
+      app: nexus
+  policyTypes: ["Egress"]
+  egress:
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgresql-backup-egress-to-postgresql
+  namespace: devops-tools
+spec:
+  podSelector:
+    matchLabels:
+      app: postgresql-backup
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgresql
+      ports:
+        - protocol: TCP
+          port: 5432
+
+---
+# ============================================================================
+# POSTGRESQL — StatefulSet
+# ============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql
+  namespace: devops-tools
+  labels:
+    app: postgresql
+    app.kubernetes.io/name: postgresql
+    app.kubernetes.io/instance: postgresql
+    app.kubernetes.io/version: "18.4"
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: devops-tools-stack
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  clusterIP: None
+  selector:
+    app: postgresql
+  ports:
+    - port: 5432
+      targetPort: 5432
+      name: postgresql
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgresql
+  namespace: devops-tools
+  labels:
+    app: postgresql
+    app.kubernetes.io/name: postgresql
+    app.kubernetes.io/instance: postgresql
+    app.kubernetes.io/version: "18.4"
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: devops-tools-stack
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  serviceName: postgresql
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: postgresql
+  template:
+    metadata:
+      labels:
+        app: postgresql
+        app.kubernetes.io/name: postgresql
+        app.kubernetes.io/component: database
+        app.kubernetes.io/part-of: devops-tools-stack
+    spec:
+      serviceAccountName: postgresql-sa
+      priorityClassName: devops-tools-critical
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        fsGroup: 999
+        runAsNonRoot: true
+        runAsUser: 999
+        seccompProfile:
+          type: RuntimeDefault
+      # --- Node placement: dedicated, tainted node pool ---
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: workload-type
+                    operator: In
+                    values: ["devops-tools"]
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: ["postgresql", "sonarqube", "nexus"]
+                topologyKey: kubernetes.io/hostname
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: devops-tools
+          effect: NoSchedule
+      containers:
+        - name: postgresql
+          image: postgres:18.4-alpine
+          imagePullPolicy: IfNotPresent
+          terminationMessagePolicy: FallbackToLogsOnError
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: false   # postgres writes to /tmp, /var/run etc. beyond PGDATA
+          ports:
+            - containerPort: 5432
+              name: postgresql
+          envFrom:
+            - secretRef:
+                name: postgresql-secret
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: postgresql-data
+              mountPath: /var/lib/postgresql/data
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "$(POSTGRES_USER)", "-d", "$(POSTGRES_DB)"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "$(POSTGRES_USER)", "-d", "$(POSTGRES_DB)"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: postgresql-data
+        labels:
+          app.kubernetes.io/part-of: devops-tools-stack
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: nfs-storage
+        resources:
+          requests:
+            storage: 20Gi
+
+---
+# ============================================================================
+# POSTGRESQL BACKUPS — nightly pg_dump to a dedicated NFS-backed PVC
+# ============================================================================
+# Requires a matching static PV (postgresql-backups-pv) if you're using
+# static provisioning — see k8s-nfs-persistentvolumes.yaml.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgresql-backups
+  namespace: devops-tools
+  labels:
+    app.kubernetes.io/part-of: devops-tools-stack
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: nfs-storage
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgresql-backup
+  namespace: devops-tools
+  labels:
+    app: postgresql-backup
+    app.kubernetes.io/name: postgresql-backup
+    app.kubernetes.io/component: database-backup
+    app.kubernetes.io/part-of: devops-tools-stack
+spec:
+  schedule: "0 2 * * *"    # 02:00 daily — adjust to your maintenance window
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app: postgresql-backup
+        spec:
+          serviceAccountName: postgresql-sa
+          priorityClassName: devops-tools-critical
+          restartPolicy: OnFailure
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: workload-type
+                        operator: In
+                        values: ["devops-tools"]
+          tolerations:
+            - key: dedicated
+              operator: Equal
+              value: devops-tools
+              effect: NoSchedule
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: pg-backup
+              image: postgres:18.4-alpine
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+              envFrom:
+                - secretRef:
+                    name: postgresql-secret
+              command:
+                - sh
+                - -c
+                - >
+                  set -e;
+                  pg_dump -h postgresql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -F c
+                  -f "/backups/${POSTGRES_DB}-$(date +%Y%m%d-%H%M%S).dump";
+                  find /backups -name "*.dump" -mtime +14 -delete
+              volumeMounts:
+                - name: postgresql-backups
+                  mountPath: /backups
+              resources:
+                requests:
+                  cpu: "250m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"
+          volumes:
+            - name: postgresql-backups
+              persistentVolumeClaim:
+                claimName: postgresql-backups
+
+---
+# ============================================================================
+# SONARQUBE — Deployment
+# ============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sonarqube-data
+  namespace: devops-tools
+  labels:
+    app.kubernetes.io/part-of: devops-tools-stack
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: nfs-storage
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sonarqube-extensions
+  namespace: devops-tools
+  labels:
+    app.kubernetes.io/part-of: devops-tools-stack
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: nfs-storage
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sonarqube-logs
+  namespace: devops-tools
+  labels:
+    app.kubernetes.io/part-of: devops-tools-stack
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: nfs-storage
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sonarqube-config
+  namespace: devops-tools
+  labels:
+    app.kubernetes.io/part-of: devops-tools-stack
+data:
+  SONAR_JDBC_URL: "jdbc:postgresql://postgresql.devops-tools.svc.cluster.local:5432/sonarqube"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sonarqube
+  namespace: devops-tools
+  labels:
+    app: sonarqube
+    app.kubernetes.io/name: sonarqube
+    app.kubernetes.io/instance: sonarqube
+    app.kubernetes.io/version: "26.8.0.126808"
+    app.kubernetes.io/component: code-quality
+    app.kubernetes.io/part-of: devops-tools-stack
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: Recreate    # avoid two instances writing to the same data volume
+  selector:
+    matchLabels:
+      app: sonarqube
+  template:
+    metadata:
+      labels:
+        app: sonarqube
+        app.kubernetes.io/name: sonarqube
+        app.kubernetes.io/component: code-quality
+        app.kubernetes.io/part-of: devops-tools-stack
+    spec:
+      serviceAccountName: sonarqube-sa
+      priorityClassName: devops-tools-standard
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: workload-type
+                    operator: In
+                    values: ["devops-tools"]
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: ["postgresql", "sonarqube", "nexus"]
+                topologyKey: kubernetes.io/hostname
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: devops-tools
+          effect: NoSchedule
+      initContainers:
+        # Elasticsearch (bundled in SonarQube) requires this kernel setting,
+        # otherwise SonarQube will crash-loop on startup in production.
+        # Must run as root — overrides the pod-level non-root default above.
+        - name: sysctl
+          image: busybox:1.36
+          securityContext:
+            privileged: true
+            runAsUser: 0
+            runAsNonRoot: false
+          command:
+            - sh
+            - -c
+            - >
+              sysctl -w vm.max_map_count=524288 &&
+              sysctl -w fs.file-max=131072 &&
+              ulimit -n 131072 &&
+              ulimit -u 8192
+        - name: fix-permissions
+          image: busybox:1.36
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+          command: ["sh", "-c", "chown -R 1000:1000 /opt/sonarqube/data /opt/sonarqube/extensions /opt/sonarqube/logs"]
+          volumeMounts:
+            - name: sonarqube-data
+              mountPath: /opt/sonarqube/data
+            - name: sonarqube-extensions
+              mountPath: /opt/sonarqube/extensions
+            - name: sonarqube-logs
+              mountPath: /opt/sonarqube/logs
+      containers:
+        - name: sonarqube
+          image: sonarqube:26.8.0.126808-community
+          imagePullPolicy: IfNotPresent
+          terminationMessagePolicy: FallbackToLogsOnError
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: false
+          ports:
+            - containerPort: 9000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: sonarqube-config
+          env:
+            - name: SONAR_JDBC_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-secret
+                  key: POSTGRES_USER
+            - name: SONAR_JDBC_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-secret
+                  key: POSTGRES_PASSWORD
+            - name: SONAR_WEB_JAVAOPTS
+              value: "-Xmx1024m -Xms512m"
+            - name: SONAR_CE_JAVAOPTS
+              value: "-Xmx1024m -Xms512m"
+          volumeMounts:
+            - name: sonarqube-data
+              mountPath: /opt/sonarqube/data
+            - name: sonarqube-extensions
+              mountPath: /opt/sonarqube/extensions
+            - name: sonarqube-logs
+              mountPath: /opt/sonarqube/logs
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          startupProbe:
+            httpGet:
+              path: /api/system/status
+              port: 9000
+            failureThreshold: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /api/system/status
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          livenessProbe:
+            httpGet:
+              path: /api/system/status
+              port: 9000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+      volumes:
+        - name: sonarqube-data
+          persistentVolumeClaim:
+            claimName: sonarqube-data
+        - name: sonarqube-extensions
+          persistentVolumeClaim:
+            claimName: sonarqube-extensions
+        - name: sonarqube-logs
+          persistentVolumeClaim:
+            claimName: sonarqube-logs
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sonarqube
+  namespace: devops-tools
+  labels:
+    app: sonarqube
+    app.kubernetes.io/name: sonarqube
+    app.kubernetes.io/component: code-quality
+    app.kubernetes.io/part-of: devops-tools-stack
+spec:
+  selector:
+    app: sonarqube
+  ports:
+    - port: 9000
+      targetPort: 9000
+      nodePort: 30900
+  type: NodePort
+
+---
+# ============================================================================
+# NEXUS — Deployment
+# ============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nexus-data
+  namespace: devops-tools
+  labels:
+    app.kubernetes.io/part-of: devops-tools-stack
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: nfs-storage
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nexus
+  namespace: devops-tools
+  labels:
+    app: nexus
+    app.kubernetes.io/name: nexus
+    app.kubernetes.io/instance: nexus
+    app.kubernetes.io/version: "3.94.2"
+    app.kubernetes.io/component: artifact-repository
+    app.kubernetes.io/part-of: devops-tools-stack
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: nexus
+  template:
+    metadata:
+      labels:
+        app: nexus
+        app.kubernetes.io/name: nexus
+        app.kubernetes.io/component: artifact-repository
+        app.kubernetes.io/part-of: devops-tools-stack
+    spec:
+      serviceAccountName: nexus-sa
+      priorityClassName: devops-tools-standard
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 200
+        fsGroup: 200
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: workload-type
+                    operator: In
+                    values: ["devops-tools"]
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: ["postgresql", "sonarqube", "nexus"]
+                topologyKey: kubernetes.io/hostname
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: devops-tools
+          effect: NoSchedule
+      initContainers:
+        # Nexus runs as UID 200 inside the container; the mounted NFS volume
+        # needs matching ownership or Nexus will fail to write data.
+        # Must run as root — overrides the pod-level non-root default above.
+        - name: fix-permissions
+          image: busybox:1.36
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+          command: ["sh", "-c", "chown -R 200:200 /nexus-data"]
+          volumeMounts:
+            - name: nexus-data
+              mountPath: /nexus-data
+      containers:
+        - name: nexus
+          image: sonatype/nexus3:3.94.2-alpine
+          imagePullPolicy: IfNotPresent
+          terminationMessagePolicy: FallbackToLogsOnError
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: false
+          ports:
+            - containerPort: 8081
+              name: http
+          env:
+            - name: INSTALL4J_ADD_VM_PARAMS
+              value: "-Xms1200m -Xmx1200m -XX:MaxDirectMemorySize=2g -Djava.util.prefs.userRoot=/nexus-data/javaprefs"
+          volumeMounts:
+            - name: nexus-data
+              mountPath: /nexus-data
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          startupProbe:
+            httpGet:
+              path: /service/rest/v1/status
+              port: 8081
+            failureThreshold: 40
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /service/rest/v1/status
+              port: 8081
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          livenessProbe:
+            httpGet:
+              path: /service/rest/v1/status
+              port: 8081
+            initialDelaySeconds: 90
+            periodSeconds: 30
+      volumes:
+        - name: nexus-data
+          persistentVolumeClaim:
+            claimName: nexus-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nexus
+  namespace: devops-tools
+  labels:
+    app: nexus
+    app.kubernetes.io/name: nexus
+    app.kubernetes.io/component: artifact-repository
+    app.kubernetes.io/part-of: devops-tools-stack
+spec:
+  selector:
+    app: nexus
+  ports:
+    - name: http
+      port: 8081
+      targetPort: 8081
+      nodePort: 30810
+    - name: docker-registry
+      port: 5000
+      targetPort: 5000
+      nodePort: 30500
+  type: NodePort
+
+---
+# ============================================================================
+# INGRESS (OPTIONAL)
+# ============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: devops-tools-ingress
+  namespace: devops-tools
+  labels:
+    app.kubernetes.io/part-of: devops-tools-stack
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    cert-manager.io/cluster-issuer: letsencrypt-prod   # remove if not using cert-manager
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - sonarqube.example.com
+        - nexus.example.com
+      secretName: devops-tools-tls
+  rules:
+    - host: sonarqube.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: sonarqube
+                port:
+                  number: 9000
+    - host: nexus.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nexus
+                port:
+                  number: 8081
