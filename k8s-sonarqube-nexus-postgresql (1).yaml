@@ -386,10 +386,10 @@ spec:
               mountPath: /nexus-data
           resources:
             requests:
-              cpu: "1"
+              cpu: "4"
               memory: "2Gi"
             limits:
-              cpu: "2"
+              cpu: "4"
               memory: "4Gi"
           startupProbe:
             httpGet:
