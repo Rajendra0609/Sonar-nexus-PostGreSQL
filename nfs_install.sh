@@ -32,7 +32,7 @@ if [[ "$MODE" == "server" ]]; then
 
   echo "==> Creating export directories..."
   sudo mkdir -p /srv/k8s-rwx
-  sudo mkdir -p /opt/sonar/{postgresql-data,sonarqube-data,sonarqube-extensions,sonarqube-logs,nexus-data}
+  sudo mkdir -p /opt/sonar/{postgresql,sonarqube-data,sonarqube-extensions,sonarqube-logs,nexus-data}
 
   echo "==> Setting ownership & permissions..."
   sudo chown -R nobody:nogroup "${EXPORT_DIRS[@]}"
